@@ -46,6 +46,40 @@ func (s *Server) ProcessWorld(req gol.Request, res *gol.Response) error {
 		s.World = nextState(req.Parameter, s.World, 0, req.Parameter.ImageHeight)
 		mutex.Lock()
 		s.CellCount = len(calculateAliveCells(req.Parameter, s.World))
+		s.Turn++
+		mutex.Unlock()
+	}
+	if req.Parameter.Threads == 1 {
+		s.World = nextState(req.Parameter, s.World, 0, req.Parameter.ImageHeight)
+	} else {
+		//TODO: NEEDED TO BE OPTIMISED
+		// create a channel
+		chans := make([]chan [][]byte, req.Parameter.Threads)
+		for i := 0; i < req.Parameter.Threads; i++ {
+			chans[i] = make(chan [][]byte)
+			a := i * (req.Parameter.ImageHeight / req.Parameter.Threads)
+			b := (i + 1) * (req.Parameter.ImageHeight / req.Parameter.Threads)
+			if i == req.Parameter.Threads-1 {
+				b = req.Parameter.ImageHeight
+			}
+			mutex.Lock()
+			worldCopy := copySlice(s.World)
+			mutex.Unlock()
+			go workers(req.Parameter, worldCopy, chans[i], a, b)
+
+		}
+		//combine all the strips produced by workers
+		for i := 0; i < req.Parameter.Threads; i++ {
+			strip := <-chans[i]
+			startRow := i * (req.Parameter.ImageHeight / req.Parameter.Threads)
+			for r, row := range strip {
+				mutex.Lock()
+				req.World[startRow+r] = row
+				mutex.Unlock()
+			}
+		}
+		mutex.Lock()
+		s.World = copySlice(req.World)
 		mutex.Unlock()
 	}
 	// Prepare the response with final state
