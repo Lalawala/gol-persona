@@ -2,12 +2,11 @@ package main
 
 import (
 	"flag"
-	"fmt"
-	"math/rand"
 	"net"
 	"net/rpc"
+	"os"
 	"sync"
-	"time"
+
 	"uk.ac.bris.cs/gameoflife/gol"
 	"uk.ac.bris.cs/gameoflife/util"
 )
@@ -25,14 +24,100 @@ type Server struct {
 	CombinedSlice [][]byte
 }
 
-//TODO:IMPLEMENT THIS
 func (s *Server) ProcessWorld(req gol.Request, res *gol.Response) error {
+	s.Turn = 0
+	s.Resume = make(chan bool)
 	mutex.Lock()
+	s.World = copySlice(req.World)
+	mutex.Unlock()
+	s.Slice = make([][]byte, req.Parameter.ImageHeight)
+	for i := range s.Slice {
+		s.Slice[i] = make([]byte, req.Parameter.ImageWidth)
+	}
+	// TODO: Execute all turns of the Game of Life.
+	if req.Parameter.Threads == 1 {
+		chans := make(chan [][]byte)
+		mutex.Lock()
+		worldCopy := copySlice(s.World)
+		go workers(req.Parameter, worldCopy, chans, req.Start, req.End)
+		strip := <-chans
+		s.Slice = copySlice(strip)
+		s.Turn++
+		mutex.Unlock()
+	} else {
+		sliceHeight := req.End - req.Start
+		//Threads in each node
+		var numThreads int
+		if len(req.World) == 16 && len(req.World[0]) == 16 {
+			numThreads = 4
+		} else {
+			numThreads = req.Parameter.Threads
+		}
+		chans := make([]chan [][]byte, numThreads)
+		for i := 0; i < numThreads; i++ {
+			chans[i] = make(chan [][]byte)
+			// calculate the starting and ending point of the slice
+			a := i * (sliceHeight / numThreads)
+			b := (i + 1) * (sliceHeight / numThreads)
+			// // in case of incomplete division, set the ending point of the last thread to the last line
+			if i == numThreads-1 {
+				b = sliceHeight
+			}
+			//to handle data race condition by passing a copy of world to goroutines
+			mutex.Lock()
+			worldCopy := copySlice(s.World)
+			mutex.Unlock()
+			// fmt.Println("a: ", a)
+			// fmt.Println("b ", b)
+			req.Parameter.ImageHeight += 2
+			go workers(req.Parameter, worldCopy, chans[i], 1+a, 1+b)
+
+		}
+		s.CombinedSlice = copySlice(s.World)
+		//combine all the strips produced by workers
+		for i := 0; i < numThreads; i++ {
+			// strip := <-chans[i]
+			// startRow := i * (sliceHeight / numThreads)
+			// for r, row := range strip {
+			// 	mutex.Lock()
+			// 	//replace each line of the old world by a new row
+			// 	//fmt.Println("+", startRow+r)
+			// 	s.CombinedSlice[startRow+r] = row
+			// 	mutex.Unlock()
+			// }
+			worldPiece := <-chans[i]
+			startRow := i * (sliceHeight / numThreads)
+			for j := 0; j < len(worldPiece); j++ {
+				copy(s.Slice[j+startRow], worldPiece[j])
+			}
+		}
+		mutex.Lock()
+		//copy the top slice to s.Slice
+		// for i := 0; i < sliceHeight; i++ {
+		// 	copy(s.Slice[i], s.CombinedSlice[1+i])
+		// }
+		//s.Slice = copySlice(s.CombinedSlice[1 : sliceHeight-1])
+		s.Turn++
+		mutex.Unlock()
+	}
+	//send the finished world and AliveCells to respond
+	mutex.Lock()
+	res.Slice = copySlice(s.Slice)
+	mutex.Unlock()
+	return nil
+}
+
+func (s *Server) KeyGol(req gol.Request, res *gol.Response) error {
+	if req.K {
+		os.Exit(0)
+	}
 	return nil
 }
 
 func nextState(p gol.Params, world [][]byte, start, end int) [][]byte {
 	// allocate space
+	// fmt.Println("end: ", end)
+	// fmt.Println("start: ", start)
 	nextWorld := make([][]byte, end-start)
 	for i := range nextWorld {
 		nextWorld[i] = make([]byte, p.ImageWidth)
@@ -74,6 +159,8 @@ func nextState(p gol.Params, world [][]byte, start, end int) [][]byte {
 }
 
 func workers(p gol.Params, world [][]byte, result chan<- [][]byte, start, end int) {
+	// fmt.Println("start in worker: ", start)
+	// fmt.Println("end in worker: ", end)
 	worldPiece := nextState(p, world, start, end)
 	result <- worldPiece
 	close(result)
@@ -100,9 +187,8 @@ func calculateAliveCells(p gol.Params, world [][]byte) []util.Cell {
 	return aliveCell
 }
 
-//TODO: NEED TO BE FIXED
 func main() {
-	pAddr := flag.String("port", "8050", "port to listen on")
+	pAddr := flag.String("port", "8040", "port to listen on")
 	flag.Parse()
 	//initialise server
 	server := &Server{
@@ -114,9 +200,6 @@ func main() {
 	if err != nil {
 		return
 	}
-	flag.Parse()
-	rand.Seed(time.Now().UnixNano())
-	//rpc.Register(&Worker{hight: 0})
 	listener, _ := net.Listen("tcp", ":"+*pAddr)
 	defer func(listener net.Listener) {
 		err := listener.Close()
@@ -125,5 +208,4 @@ func main() {
 		}
 	}(listener)
 	rpc.Accept(listener)
-	fmt.Println("connected")
 }
